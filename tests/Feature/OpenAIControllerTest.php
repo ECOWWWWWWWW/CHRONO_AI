@@ -2,56 +2,102 @@
 
 namespace Tests\Feature;
 
+use App\Services\Gemini\GeminiService;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Log;
 use Tests\TestCase;
 
 class OpenAIControllerTest extends TestCase
 {
     public function test_exponential_backoff_retries_on_failure_then_succeeds()
     {
-        // 1. Fake the HTTP client to fail twice, then succeed on the 3rd try
         Http::fakeSequence()
-            ->pushStatus(503) // Attempt 1 fails
-            ->pushStatus(503) // Attempt 2 fails
-            ->push([          // Attempt 3 succeeds
+            ->pushStatus(503)
+            ->pushStatus(503)
+            ->push([
                 'steps' => [
-                    ['type' => 'model_output', 'content' => [['text' => 'Success after backoff!']]]
-                ]
+                    [
+                        'type' => 'model_output',
+                        'content' => [
+                            [
+                                'type' => 'text',
+                                'text' => 'Success after backoff!',
+                            ],
+                        ],
+                    ],
+                ],
             ], 200);
 
-        // 2. Make the request to the exact route we defined in web.php
         $response = $this->postJson('/test', [
             'prompt' => 'Create a lesson plan',
-            'history' => []
+            'history' => [],
         ]);
 
-        // 3. Assert it eventually succeeded
         $response->assertStatus(200)
             ->assertJson([
                 'success' => true,
-                'reply' => 'Success after backoff!'
+                'reply' => 'Success after backoff!',
             ]);
 
-        // 4. Assert that Laravel actually made 3 requests (1 initial + 2 retries)
         Http::assertSentCount(3);
     }
 
     public function test_it_does_not_retry_on_400_bad_request()
     {
-        // Fake a 400 error (e.g., invalid prompt)
         Http::fake([
-            '*' => Http::response(['error' => 'Invalid prompt'], 400)
+            '*' => Http::response([
+                'error' => [
+                    'message' => 'Invalid prompt',
+                    'status' => 'INVALID_ARGUMENT',
+                ],
+            ], 400),
         ]);
 
         $response = $this->postJson('/test', [
             'prompt' => 'Invalid prompt that triggers safety filter',
         ]);
 
-        // Your controller returns 500 when $response->failed() is true
-        $response->assertStatus(500);
+        $response->assertStatus(500)
+            ->assertJsonPath('success', false)
+            ->assertJsonPath('exception', 'GeminiRequestFailedException')
+            ->assertJsonPath('details.upstream_status', 400);
 
-        // Assert it was ONLY called ONCE. If it retried, this would fail.
         Http::assertSentCount(1);
+    }
+
+    public function test_service_can_inject_rag_context_into_system_instruction()
+    {
+        Http::fake([
+            '*' => Http::response([
+                'steps' => [
+                    [
+                        'type' => 'model_output',
+                        'content' => [
+                            [
+                                'type' => 'text',
+                                'text' => 'Grounded answer.',
+                            ],
+                        ],
+                    ],
+                ],
+            ], 200),
+        ]);
+
+        $service = app(GeminiService::class);
+
+        $reply = $service->generate(
+            prompt: 'Create a lesson plan for Chapter 4.',
+            history: [],
+            context: 'Chapter 4 covers the water cycle, including evaporation, condensation, and precipitation.'
+        );
+
+        $this->assertSame('Grounded answer.', $reply);
+
+        Http::assertSent(function ($request) {
+            $payload = $request->data();
+
+            return isset($payload['system_instruction'])
+                && str_contains($payload['system_instruction'], '[RETRIEVED CURRICULUM CONTEXT]')
+                && str_contains($payload['system_instruction'], 'Chapter 4 covers the water cycle');
+        });
     }
 }
