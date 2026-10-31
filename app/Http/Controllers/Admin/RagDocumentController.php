@@ -8,89 +8,77 @@ use App\Models\RagDocument;
 use App\Services\Rag\RagDocumentService;
 use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Log;
+use Throwable;
 
 class RagDocumentController extends Controller
 {
     public function store(Request $request, RagDocumentService $documents): JsonResponse
     {
         $validated = $request->validate([
-            'file' => [
-                'required',
-                'file',
-                'mimes:pdf,docx,txt,md,markdown',
-                'max:51200',
-            ],
-            'title' => [
-                'required',
-                'string',
-                'max:255',
-            ],
-            'source_type' => [
-                'nullable',
-                'string',
-                'in:' . implode(',', [
-                    RagDocument::SOURCE_ADMIN_CURRICULUM,
-                    RagDocument::SOURCE_TEACHER_RESOURCE,
-                    RagDocument::SOURCE_UPLOADED_FILE,
-                ]),
-            ],
-            'metadata' => [
-                'nullable',
-                'array',
-            ],
-            'metadata.school_id' => [
-                'nullable',
-                'integer',
-            ],
-            'metadata.subject' => [
-                'nullable',
-                'string',
-                'max:255',
-            ],
-            'metadata.grade' => [
-                'nullable',
-                'string',
-                'max:100',
-            ],
-            'metadata.chapter' => [
-                'nullable',
-                'string',
-                'max:255',
-            ],
-            'metadata.visibility' => [
-                'nullable',
-                'string',
-                'in:global,school,private',
-            ],
+            'file' => ['required', 'file', 'mimes:pdf,docx,txt,md,markdown', 'max:51200'],
+            'title' => ['required', 'string', 'max:255'],
+            'source_type' => ['nullable', 'string'],
+            'metadata' => ['nullable', 'array'],
         ]);
 
-        $document = $documents->createFromUpload(
-            file: $request->file('file'),
-            title: $validated['title'],
-            sourceType: $validated['source_type'] ?? RagDocument::SOURCE_ADMIN_CURRICULUM,
-            metadata: $validated['metadata'] ?? [],
-            createdBy: $request->user()?->id,
-        );
+        // 1. Get metadata from request
+        $metadata = $validated['metadata'] ?? [];
 
-        $job = new IndexRagDocument($document);
+        // 2. FORCE 'global' visibility for all Admin uploads
+        // Teachers/Master Teachers cannot upload, so anything here is Official.
+        $metadata['visibility'] = 'global';
 
-        if ($connection = config('rag.queue.connection')) {
-            $job->onConnection($connection);
+        // Optional: Tag who uploaded it for audit logs (not for filtering)
+        $metadata['uploaded_by_role'] = $request->user()->role;
+
+        try {
+            $document = $documents->createFromUpload(
+                file: $request->file('file'),
+                title: $validated['title'],
+                sourceType: $validated['source_type'] ?? RagDocument::SOURCE_ADMIN_CURRICULUM,
+                metadata: $metadata,
+                createdBy: $request->user()?->id,
+            );
+
+            // Synchronous execution for testing
+            $job = new IndexRagDocument($document);
+            $job->handle(app(RagDocumentService::class));
+
+            $document->refresh();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Document processed successfully.',
+                'document' => [
+                    'id' => $document->id,
+                    'title' => $document->title,
+                    'status' => $document->status,
+                    'chunks_count' => $document->chunks()->count(),
+                    'metadata_used' => $document->metadata,
+                ]
+            ], 200);
+        } catch (Throwable $e) {
+            Log::error('RAG Ingestion Failed', ['error' => $e->getMessage()]);
+            return response()->json([
+                'success' => false,
+                'message' => 'Ingestion failed: ' . $e->getMessage(),
+            ], 500);
         }
+    }
 
-        dispatch($job);
+    public function index(): JsonResponse
+    {
+        // Fetch the last 10 documents, ordered by newest first
+        $docs = RagDocument::latest()->take(10)->get();
 
-        return response()->json([
-            'success' => true,
-            'message' => 'Document accepted for indexing.',
-            'document' => $document->only([
-                'id',
-                'title',
-                'source_type',
-                'status',
-                'created_at',
-            ]),
-        ], 202);
+        return response()->json($docs->map(fn($doc) => [
+            'id' => $doc->id,
+            'title' => $doc->title,
+            'status' => $doc->status,
+            'chunks' => $doc->chunks()->count(),
+            'created_at' => $doc->created_at->diffForHumans(),
+        ]));
     }
 
     public function show(RagDocument $document): JsonResponse

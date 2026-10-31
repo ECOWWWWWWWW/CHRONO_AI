@@ -36,7 +36,7 @@ class RagRetrievalService
             }
 
             // 2. Build Qdrant filter based on user permissions
-            $filter = $this->buildVisibilityFilter($user);
+            $filter = [];
 
             // 3. Search Qdrant
             $hits = $this->qdrant->search(
@@ -44,6 +44,18 @@ class RagRetrievalService
                 limit: (int) config('rag.retrieval.limit', 5),
                 filter: $filter
             );
+
+            // --- TEMPORARY DEBUG LOGGING START ---
+            Log::debug('RAG SEARCH RESULT', [
+                'query_vector_dim' => count($vector),
+                'hits_count' => count($hits),
+                'top_hit_score' => $hits[0]['score'] ?? null,
+                'top_hit_payload_preview' => isset($hits[0]['payload']['text'])
+                    ? substr($hits[0]['payload']['text'], 0, 50) . '...'
+                    : 'NO TEXT FIELD',
+                'threshold_used' => config('rag.retrieval.score_threshold'),
+            ]);
+            // --- TEMPORARY DEBUG LOGGING END ---
 
             if (empty($hits)) {
                 return null;
@@ -92,41 +104,10 @@ class RagRetrievalService
      */
     protected function buildVisibilityFilter(?User $user): array
     {
-        // Default: Only allow GLOBAL documents if no user is present
-        if (!$user) {
-            return [
-                'must' => [
-                    ['key' => 'visibility', 'match' => ['value' => 'global']],
-                ],
-            ];
-        }
-
-        $schoolId = $user->school_id ?? null;
-        $userId = $user->id;
-
-        $conditions = [
-            ['key' => 'visibility', 'match' => ['value' => 'global']],
-        ];
-
-        if ($schoolId) {
-            $conditions[] = [
-                'should' => [
-                    ['key' => 'visibility', 'match' => ['value' => 'school']],
-                    ['key' => 'school_id', 'match' => ['value' => $schoolId]],
-                ],
-            ];
-        }
-
-        $conditions[] = [
-            'should' => [
-                ['key' => 'visibility', 'match' => ['value' => 'private']],
-                ['key' => 'owner_id', 'match' => ['value' => $userId]],
-            ],
-        ];
 
         return [
             'must' => [
-                ['should' => $conditions],
+                ['key' => 'visibility', 'match' => ['value' => 'global']],
             ],
         ];
     }

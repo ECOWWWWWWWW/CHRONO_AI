@@ -103,6 +103,7 @@ class RagDocumentService
 
     public function index(RagDocument $document): void
     {
+        Log::info('=== RAG INDEX START ===', ['doc_id' => $document->id]);
         $document->update([
             'status' => RagDocument::STATUS_PROCESSING,
             'error_message' => null,
@@ -209,7 +210,18 @@ class RagDocumentService
                 ];
             }
 
+            // After chunking:
+            Log::info('Chunks created', ['count' => count($chunks)]);
+
+            // Before Upsert:
+            Log::info('Preparing to upsert to Qdrant...', [
+                'collection' => config('qdrant.collection'),
+                'points_count' => count($points)
+            ]);
+
             $this->qdrant->upsertPoints($points);
+
+            Log::info('Qdrant Upsert SUCCESS');
 
             $document->chunks()->update([
                 'indexed_at' => $now,
@@ -219,6 +231,8 @@ class RagDocumentService
                 'status' => RagDocument::STATUS_INDEXED,
                 'error_message' => null,
             ]);
+
+            Log::info('=== RAG INDEX END SUCCESS ===', ['doc_id' => $document->id]);
         } catch (Throwable $e) {
             Log::error('RAG document indexing failed', [
                 'document_id' => $document->id,
